@@ -60,11 +60,7 @@ def _use_triton_fallback() -> bool:
     if not current_platform.is_cuda():
         return False
     capability = current_platform.get_device_capability()
-    return not (
-        has_deep_gemm()
-        and capability is not None
-        and capability.major >= 9
-    )
+    return not (has_deep_gemm() and capability is not None and capability.major >= 9)
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -337,6 +333,7 @@ def sparse_attn_indexer(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    compress_ratio: int = 1,
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
@@ -344,9 +341,7 @@ def sparse_attn_indexer(
     attn_metadata = forward_context.attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     device_capability = (
-        current_platform.get_device_capability()
-        if current_platform.is_cuda()
-        else None
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     use_deep_gemm = (
         current_platform.is_cuda()
@@ -673,6 +668,8 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         elif use_triton_fallback:
+            # V4 metadata keeps the uncompressed length; logits index compressed KV.
+            logits_width = max(1, attn_metadata_narrowed.max_seq_len // compress_ratio)
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_quant_decode_tokens,
                 kv_cache,
@@ -680,7 +677,7 @@ def sparse_attn_indexer(
                 triton_seq_lens,
                 decode_lens,
                 decode_metadata.block_table,
-                max_model_len=attn_metadata_narrowed.max_seq_len,
+                max_model_len=min(logits_width, max_model_len),
                 clean_logits=False,
             )
         else:
@@ -795,6 +792,7 @@ def sparse_attn_indexer_fake(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    compress_ratio: int = 1,
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
@@ -925,6 +923,7 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            self.compress_ratio,
         )
 
     def forward_xpu(
